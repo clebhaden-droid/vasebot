@@ -1,0 +1,359 @@
+import os
+import random
+import datetime
+import requests
+from io import BytesIO
+
+import asyncpg
+import discord
+from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
+
+# -------------------
+# KEEP ALIVE (24/7)
+# -------------------
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# -------------------
+# BOT SETUP
+# -------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# -------------------
+# DATA
+# -------------------
+xp = {}
+levels = {}
+warnings = {}
+xp_cooldown = {}
+COOLDOWN_TIME = 30  # seconds
+
+BAD_WORDS = ["niger", "nigger", "nigga"]
+LOG_CHANNEL_NAME = "mod-logs"
+db = None
+
+# -------------------
+# DATABASE FUNCTIONS
+# -------------------
+async def get_log_channel(guild):
+    for channel in guild.text_channels:
+        if channel.name == LOG_CHANNEL_NAME:
+            return channel
+    return None
+
+async def save_user(user_id):
+    await db.execute(
+        """
+        INSERT INTO user_data (user_id, xp, level)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE SET xp = $2, level = $3
+        """,
+        user_id, xp[user_id], levels[user_id]
+    )
+
+async def save_warning(user_id):
+    await db.execute(
+        """
+        INSERT INTO user_warnings (user_id, warning_count)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE SET warning_count = $2
+        """,
+        user_id, warnings[user_id]
+    )
+
+# -------------------
+# READY EVENT
+# -------------------
+@bot.event
+async def on_ready():
+    global db
+    try:
+        db = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+    except Exception as e:
+        print("Database connection failed:", e)
+        return
+
+    rows = await db.fetch("SELECT user_id, xp, level FROM user_data")
+    for row in rows:
+        xp[row["user_id"]] = row["xp"]
+        levels[row["user_id"]] = row["level"]
+
+    warn_rows = await db.fetch("SELECT user_id, warning_count FROM user_warnings")
+    for row in warn_rows:
+        warnings[row["user_id"]] = row["warning_count"]
+
+    print(f"Logged in as {bot.user} — loaded {len(xp)} users.")
+
+# -------------------
+# MESSAGE EVENT
+# -------------------
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    content = f" {message.content.lower()} "
+
+    for word in BAD_WORDS:
+        if f" {word} " in content:
+            await message.delete()
+            await message.channel.send(f"{message.author.mention}, watch your language!")
+            return
+
+    user_id = message.author.id
+    if user_id not in xp:
+        xp[user_id] = 0
+        levels[user_id] = 1
+
+    # XP cooldown
+    now = datetime.datetime.utcnow()
+    if user_id in xp_cooldown:
+        diff = (now - xp_cooldown[user_id]).total_seconds()
+        if diff < COOLDOWN_TIME:
+            await bot.process_commands(message)
+            return
+    xp_cooldown[user_id] = now
+
+    # XP gain and level up
+    xp_gain = random.randint(5, 15)
+    xp[user_id] += xp_gain
+
+    if xp[user_id] >= levels[user_id] * 100:
+        xp[user_id] = 0
+        levels[user_id] += 1
+        await message.channel.send(
+            f"🎉 {message.author.mention} leveled up to level {levels[user_id]}!"
+        )
+
+    await save_user(user_id)
+    await bot.process_commands(message)
+
+# -------------------
+# WARN SYSTEM
+# -------------------
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
+    warnings[member.id] = warnings.get(member.id, 0) + 1
+    await save_warning(member.id)
+    await ctx.send(f"{member.mention} warned. Total warnings: {warnings[member.id]}")
+    if warnings[member.id] >= 3:
+        await member.timeout(datetime.timedelta(minutes=60))
+        await ctx.send(f"{member.mention} timed out for 60 minutes.")
+
+# -------------------
+# MODERATION
+# -------------------
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason"):
+    await member.kick(reason=reason)
+    await ctx.send(f"{member} kicked.")
+    log = await get_log_channel(ctx.guild)
+    if log:
+        await log.send(f"{member} was kicked. Reason: {reason}")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason"):
+    await member.ban(reason=reason)
+    await ctx.send(f"{member} banned.")
+    log = await get_log_channel(ctx.guild)
+    if log:
+        await log.send(f"{member} was banned. Reason: {reason}")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def clear(ctx, target=None, amount: int = 10):
+    try:
+        if target:
+            member = await commands.MemberConverter().convert(ctx, target)
+            deleted = await ctx.channel.purge(limit=200, check=lambda m: m.author == member)
+            deleted = deleted[:amount]
+            await ctx.send(f"Deleted {len(deleted)} messages from {member.mention}.", delete_after=3)
+        else:
+            await ctx.channel.purge(limit=amount)
+            await ctx.send(f"Deleted {amount} messages.", delete_after=3)
+    except commands.MemberNotFound:
+        await ctx.send("User not found.", delete_after=5)
+
+# -------------------
+# TRUMP RANK CARD
+# -------------------
+@bot.command()
+async def rank(ctx, member: discord.Member = None):
+    if member is None:
+        member = ctx.author
+
+    user_id = member.id
+    lvl = levels.get(user_id, 1)
+    user_xp = xp.get(user_id, 0)
+    xp_needed = lvl * 100
+
+    W, H = 900, 300
+
+    try:
+        bg = Image.open("attached_assets/trump_bg.png").convert("RGBA")
+    except:
+        bg = Image.new("RGBA", (W, H), (20, 20, 20))
+
+    # Resize and crop
+    bg_ratio = bg.width / bg.height
+    if bg_ratio > W / H:
+        new_h = H
+        new_w = int(H * bg_ratio)
+    else:
+        new_w = W
+        new_h = int(W / bg_ratio)
+    bg = bg.resize((new_w, new_h))
+    x_off = new_w - W
+    y_off = (new_h - H) // 2
+    bg = bg.crop((x_off, y_off, x_off + W, y_off + H))
+
+    # Dark overlay
+    dark = Image.new("RGBA", (W, H), (0, 0, 30, 0))
+    draw_dark = ImageDraw.Draw(dark)
+    for y in range(H):
+        a = int(180 * (y / H) ** 1.5)
+        draw_dark.line([(0, y), (W, y)], fill=(0, 0, 30, a))
+    img = Image.alpha_composite(bg, dark)
+
+    # Panel
+    panel_x1, panel_y1, panel_x2, panel_y2 = 15, 178, W - 15, H - 15
+    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    panel_draw = ImageDraw.Draw(panel)
+    panel_draw.rounded_rectangle(
+        [panel_x1, panel_y1, panel_x2, panel_y2],
+        radius=18, fill=(10, 10, 40, 210)
+    )
+    panel_draw.rounded_rectangle(
+        [panel_x1, panel_y1, panel_x2, panel_y2],
+        radius=18, outline=(60, 80, 180, 180), width=2
+    )
+    img = Image.alpha_composite(img, panel)
+
+    # Avatar
+    av_size = 100
+    av_cx, av_cy = panel_x1 + 10 + av_size // 2, panel_y1 + (panel_y2 - panel_y1) // 2
+    response = requests.get(member.display_avatar.url, timeout=10)
+    avatar = Image.open(BytesIO(response.content)).resize((av_size, av_size)).convert("RGBA")
+    av_mask = Image.new("L", (av_size, av_size), 0)
+    ImageDraw.Draw(av_mask).ellipse((0, 0, av_size, av_size), fill=255)
+
+    # Glow
+    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow_layer)
+    ax, ay = panel_x1 + 10, av_cy - av_size // 2
+    for i in range(8, 0, -1):
+        alpha = int(180 * (i / 8))
+        glow_draw.ellipse(
+            [ax - i, ay - i, ax + av_size + i, ay + av_size + i],
+            outline=(191, 10, 48, alpha), width=2
+        )
+    for i in range(5, 0, -1):
+        alpha = int(200 * (i / 5))
+        glow_draw.ellipse(
+            [ax - 10 - i, ay - 10 - i, ax + av_size + 10 + i, ay + av_size + 10 + i],
+            outline=(0, 120, 255, alpha), width=2
+        )
+    img = Image.alpha_composite(img, glow_layer)
+
+    # Avatar border
+    border_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    border_mask2 = Image.new("L", (av_size + 8, av_size + 8), 0)
+    ImageDraw.Draw(border_mask2).ellipse((0, 0, av_size + 8, av_size + 8), fill=255)
+    white_ring = Image.new("RGBA", (av_size + 8, av_size + 8), (255, 255, 255, 255))
+    border_layer.paste(white_ring, (ax - 4, ay - 4), border_mask2)
+    img = Image.alpha_composite(img, border_layer)
+    img.paste(avatar, (ax, ay), av_mask)
+
+    draw = ImageDraw.Draw(img)
+
+    # Fonts
+    font_name  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+    font_level = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    font_xp    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+
+    text_x = ax + av_size + 18
+    draw.text((text_x + 1, panel_y1 + 14 + 1), member.display_name, font=font_name, fill=(0,0,0,180))
+    draw.text((text_x, panel_y1 + 14), member.display_name, font=font_name, fill=(255,255,255))
+
+    draw.text((text_x + 1, panel_y1 + 51), "LEVEL:  ", font=font_level, fill=(0,0,0,160))
+    draw.text((text_x, panel_y1 + 50), "LEVEL:  ", font=font_level, fill=(255,220,0))
+    lvl_offset = int(font_level.getlength("LEVEL:  "))
+    draw.text((text_x + lvl_offset, panel_y1 + 50), str(lvl), font=font_level, fill=(255,255,255))
+
+    # XP bar
+    bar_x  = ax + av_size + 18
+    bar_y  = panel_y2 - 28
+    bar_w  = panel_x2 - bar_x - 20
+    bar_h  = 22
+    bar_r  = bar_h // 2
+    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=bar_r, fill=(15,15,40))
+
+    progress = max(0, int((user_xp / xp_needed) * bar_w))
+    if progress > 0:
+        fill_bar = Image.new("RGBA", (bar_w, bar_h), (0,0,0,0))
+        for bx in range(min(progress, bar_w)):
+            t = bx / bar_w
+            r = int(220*(1-t) + 0*t)
+            g = int(10*(1-t) + 120*t)
+            b = int(50*(1-t) + 255*t)
+            for by in range(bar_h):
+                fill_bar.putpixel((bx, by), (r,g,b,255))
+        fill_mask = Image.new("L", (bar_w, bar_h), 0)
+        ImageDraw.Draw(fill_mask).rounded_rectangle([0,0,bar_w,bar_h], radius=bar_r, fill=255)
+        img.paste(fill_bar, (bar_x, bar_y), fill_mask)
+
+    draw.rounded_rectangle([bar_x, bar_y, bar_x+bar_w, bar_y+bar_h], radius=bar_r, outline=(80,100,200,200), width=2)
+    xp_text = f"{user_xp} / {xp_needed} XP"
+    xp_tw = int(font_xp.getlength(xp_text))
+    xp_tx = bar_x + (bar_w - xp_tw) // 2
+    xp_ty = bar_y + (bar_h - 16) // 2
+    draw.text((xp_tx+1, xp_ty+1), xp_text, font=font_xp, fill=(0,0,0,180))
+    draw.text((xp_tx, xp_ty), xp_text, font=font_xp, fill=(255,255,255))
+
+    img.convert("RGB").save("rank.png")
+    await ctx.send(file=discord.File("rank.png"))
+
+# -------------------
+# LEADERBOARD
+# -------------------
+@bot.command()
+async def leaderboard(ctx):
+    sorted_users = sorted(levels.items(), key=lambda x: (x[1], xp.get(x[0],0)), reverse=True)[:10]
+    msg = "**🏆 Leaderboard**\n"
+    for i, (user_id, level) in enumerate(sorted_users,1):
+        user = await bot.fetch_user(user_id)
+        user_xp_val = xp.get(user_id,0)
+        msg += f"{i}. {user.name} — Level {level} ({user_xp_val}/{level*100} XP)\n"
+    await ctx.send(msg)
+
+# -------------------
+# START BOT
+# -------------------
+keep_alive()
+
+token = os.environ.get("DISCORD_TOKEN")
+if not token:
+    print("ERROR: DISCORD_TOKEN not set.")
+else:
+    bot.run(token)
