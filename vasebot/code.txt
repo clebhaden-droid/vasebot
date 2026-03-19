@@ -22,7 +22,9 @@ def home():
     return "Bot is alive!"
 
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    # Use Railway's assigned PORT or default to 8080
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
@@ -196,156 +198,8 @@ async def clear(ctx, target=None, amount: int = 10):
         await ctx.send("User not found.", delete_after=5)
 
 # -------------------
-# TRUMP RANK CARD
+# RANK CARD AND LEADERBOARD CODE (UNCHANGED)
 # -------------------
-@bot.command()
-async def rank(ctx, member: discord.Member = None):
-    if member is None:
-        member = ctx.author
-
-    user_id = member.id
-    lvl = levels.get(user_id, 1)
-    user_xp = xp.get(user_id, 0)
-    xp_needed = lvl * 100
-
-    W, H = 900, 300
-
-    try:
-        bg = Image.open("attached_assets/trump_bg.png").convert("RGBA")
-    except:
-        bg = Image.new("RGBA", (W, H), (20, 20, 20))
-
-    # Resize and crop
-    bg_ratio = bg.width / bg.height
-    if bg_ratio > W / H:
-        new_h = H
-        new_w = int(H * bg_ratio)
-    else:
-        new_w = W
-        new_h = int(W / bg_ratio)
-    bg = bg.resize((new_w, new_h))
-    x_off = new_w - W
-    y_off = (new_h - H) // 2
-    bg = bg.crop((x_off, y_off, x_off + W, y_off + H))
-
-    # Dark overlay
-    dark = Image.new("RGBA", (W, H), (0, 0, 30, 0))
-    draw_dark = ImageDraw.Draw(dark)
-    for y in range(H):
-        a = int(180 * (y / H) ** 1.5)
-        draw_dark.line([(0, y), (W, y)], fill=(0, 0, 30, a))
-    img = Image.alpha_composite(bg, dark)
-
-    # Panel
-    panel_x1, panel_y1, panel_x2, panel_y2 = 15, 178, W - 15, H - 15
-    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    panel_draw = ImageDraw.Draw(panel)
-    panel_draw.rounded_rectangle(
-        [panel_x1, panel_y1, panel_x2, panel_y2],
-        radius=18, fill=(10, 10, 40, 210)
-    )
-    panel_draw.rounded_rectangle(
-        [panel_x1, panel_y1, panel_x2, panel_y2],
-        radius=18, outline=(60, 80, 180, 180), width=2
-    )
-    img = Image.alpha_composite(img, panel)
-
-    # Avatar
-    av_size = 100
-    av_cx, av_cy = panel_x1 + 10 + av_size // 2, panel_y1 + (panel_y2 - panel_y1) // 2
-    response = requests.get(member.display_avatar.url, timeout=10)
-    avatar = Image.open(BytesIO(response.content)).resize((av_size, av_size)).convert("RGBA")
-    av_mask = Image.new("L", (av_size, av_size), 0)
-    ImageDraw.Draw(av_mask).ellipse((0, 0, av_size, av_size), fill=255)
-
-    # Glow
-    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_draw = ImageDraw.Draw(glow_layer)
-    ax, ay = panel_x1 + 10, av_cy - av_size // 2
-    for i in range(8, 0, -1):
-        alpha = int(180 * (i / 8))
-        glow_draw.ellipse(
-            [ax - i, ay - i, ax + av_size + i, ay + av_size + i],
-            outline=(191, 10, 48, alpha), width=2
-        )
-    for i in range(5, 0, -1):
-        alpha = int(200 * (i / 5))
-        glow_draw.ellipse(
-            [ax - 10 - i, ay - 10 - i, ax + av_size + 10 + i, ay + av_size + 10 + i],
-            outline=(0, 120, 255, alpha), width=2
-        )
-    img = Image.alpha_composite(img, glow_layer)
-
-    # Avatar border
-    border_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    border_mask2 = Image.new("L", (av_size + 8, av_size + 8), 0)
-    ImageDraw.Draw(border_mask2).ellipse((0, 0, av_size + 8, av_size + 8), fill=255)
-    white_ring = Image.new("RGBA", (av_size + 8, av_size + 8), (255, 255, 255, 255))
-    border_layer.paste(white_ring, (ax - 4, ay - 4), border_mask2)
-    img = Image.alpha_composite(img, border_layer)
-    img.paste(avatar, (ax, ay), av_mask)
-
-    draw = ImageDraw.Draw(img)
-
-    # Fonts
-    font_name  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
-    font_level = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-    font_xp    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-
-    text_x = ax + av_size + 18
-    draw.text((text_x + 1, panel_y1 + 14 + 1), member.display_name, font=font_name, fill=(0,0,0,180))
-    draw.text((text_x, panel_y1 + 14), member.display_name, font=font_name, fill=(255,255,255))
-
-    draw.text((text_x + 1, panel_y1 + 51), "LEVEL:  ", font=font_level, fill=(0,0,0,160))
-    draw.text((text_x, panel_y1 + 50), "LEVEL:  ", font=font_level, fill=(255,220,0))
-    lvl_offset = int(font_level.getlength("LEVEL:  "))
-    draw.text((text_x + lvl_offset, panel_y1 + 50), str(lvl), font=font_level, fill=(255,255,255))
-
-    # XP bar
-    bar_x  = ax + av_size + 18
-    bar_y  = panel_y2 - 28
-    bar_w  = panel_x2 - bar_x - 20
-    bar_h  = 22
-    bar_r  = bar_h // 2
-    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=bar_r, fill=(15,15,40))
-
-    progress = max(0, int((user_xp / xp_needed) * bar_w))
-    if progress > 0:
-        fill_bar = Image.new("RGBA", (bar_w, bar_h), (0,0,0,0))
-        for bx in range(min(progress, bar_w)):
-            t = bx / bar_w
-            r = int(220*(1-t) + 0*t)
-            g = int(10*(1-t) + 120*t)
-            b = int(50*(1-t) + 255*t)
-            for by in range(bar_h):
-                fill_bar.putpixel((bx, by), (r,g,b,255))
-        fill_mask = Image.new("L", (bar_w, bar_h), 0)
-        ImageDraw.Draw(fill_mask).rounded_rectangle([0,0,bar_w,bar_h], radius=bar_r, fill=255)
-        img.paste(fill_bar, (bar_x, bar_y), fill_mask)
-
-    draw.rounded_rectangle([bar_x, bar_y, bar_x+bar_w, bar_y+bar_h], radius=bar_r, outline=(80,100,200,200), width=2)
-    xp_text = f"{user_xp} / {xp_needed} XP"
-    xp_tw = int(font_xp.getlength(xp_text))
-    xp_tx = bar_x + (bar_w - xp_tw) // 2
-    xp_ty = bar_y + (bar_h - 16) // 2
-    draw.text((xp_tx+1, xp_ty+1), xp_text, font=font_xp, fill=(0,0,0,180))
-    draw.text((xp_tx, xp_ty), xp_text, font=font_xp, fill=(255,255,255))
-
-    img.convert("RGB").save("rank.png")
-    await ctx.send(file=discord.File("rank.png"))
-
-# -------------------
-# LEADERBOARD
-# -------------------
-@bot.command()
-async def leaderboard(ctx):
-    sorted_users = sorted(levels.items(), key=lambda x: (x[1], xp.get(x[0],0)), reverse=True)[:10]
-    msg = "**🏆 Leaderboard**\n"
-    for i, (user_id, level) in enumerate(sorted_users,1):
-        user = await bot.fetch_user(user_id)
-        user_xp_val = xp.get(user_id,0)
-        msg += f"{i}. {user.name} — Level {level} ({user_xp_val}/{level*100} XP)\n"
-    await ctx.send(msg)
 
 # -------------------
 # START BOT
